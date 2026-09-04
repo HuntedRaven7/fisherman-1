@@ -138,9 +138,11 @@ func (o Options) scratchDir() string {
 }
 
 // containerOCICachePath is the container-side path where the OCI cache is
-// bind-mounted when running bootc via a podman container. Using /run/fisherman
-// avoids any interaction with /var/tmp (which may be a tmpfs in some container
-// runtime configurations) and keeps the OCI cache mount at a dedicated path.
+// bind-mounted when running bootc via a podman container. The mount lives at a
+// dedicated /run/fisherman path rather than under /var/tmp — /var/tmp is bound
+// to the disk-backed scratch dir (so bootc's blob staging never hits a tmpfs,
+// see #20) and keeping the cache separate avoids the nested-mount issues on
+// btrfs-on-LUKS that made the cache invisible under /var/tmp (see #38).
 const containerOCICachePath = "/run/fisherman/oci-cache"
 
 // BuildBootcArgs builds the argument slice for `bootc install to-filesystem`.
@@ -451,14 +453,17 @@ func bootcViaContainer(opts Options) error {
 
 	if useOciLayout {
 		ociCacheHost := filepath.Join(scratch, "oci-cache")
-		// Non-composefs (ostree) installs: bootc needs disk-backed /var/tmp
-		// for deployment scratch.  tmpfs would consume VM RAM and OOM-kill.
-		// Composefs uses tmpfs because the OCI cache is at a dedicated mount.
-		if !opts.ComposeFsBackend {
-			podmanArgs = append(podmanArgs, "-v", scratch+":/var/tmp:z")
-		} else {
-			podmanArgs = append(podmanArgs, "--tmpfs", "/var/tmp")
-		}
+		// Both composefs and non-composefs installs need disk-backed /var/tmp
+		// inside the bootc container. containers/storage hardcodes its
+		// blob-staging TMPDir to /var/tmp, and bootc's internal imgstorage
+		// writes layer blobs there (e.g. /var/tmp/container_images_storage*/60)
+		// while reading the raw OCI blobs from the cache. On a live ISO
+		// /var/tmp must therefore be the disk-backed scratch dir — a tmpfs
+		// fills up and fails with ENOSPC on multi-GiB composefs images.
+		// The OCI cache is mounted at the dedicated /run/fisherman/oci-cache
+		// path below, so bind-mounting the whole scratch dir at /var/tmp does
+		// not hide the cache (the original bug in #38).
+		podmanArgs = append(podmanArgs, "-v", scratch+":/var/tmp:z")
 		podmanArgs = append(podmanArgs,
 			"-v", ociCacheHost+":"+containerOCICachePath+":ro")
 	} else {
@@ -612,11 +617,13 @@ func bootcToDiskViaContainer(opts Options, diskDevice, filesystem string) (effec
 		podmanArgs = append(podmanArgs, "-v", "/sys/firmware/efi/efivars:/sys/firmware/efi/efivars")
 	}
 
-	if opts.ComposeFsBackend {
-		podmanArgs = append(podmanArgs, "--tmpfs", "/var/tmp")
-	} else {
-		podmanArgs = append(podmanArgs, "-v", scratch+":/var/tmp:z")
-	}
+	// Both composefs and non-composefs installs need disk-backed /var/tmp
+	// inside the bootc container: containers/storage hardcodes its
+	// blob-staging TMPDir to /var/tmp (e.g. /var/tmp/container_images_storage*/),
+	// so a tmpfs here fills up and fails with ENOSPC on multi-GiB images.
+	// The OCI cache is mounted at the dedicated /run/fisherman/oci-cache path,
+	// so mounting the whole scratch dir at /var/tmp does not hide the cache.
+	podmanArgs = append(podmanArgs, "-v", scratch+":/var/tmp:z")
 
 	if opts.ComposeFsBackend {
 		// composefs-backend requires raw OCI blobs (compressed layer tarballs)

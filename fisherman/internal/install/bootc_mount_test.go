@@ -11,7 +11,8 @@ import (
 	"github.com/tuna-os/fisherman/internal/install"
 )
 
-// TestComposeFsMountStrategy_Issue38 is a regression test for issue #38.
+// TestComposeFsMountStrategy_Issue38 is a regression test for issue #38,
+// updated for issue #20.
 //
 // Issue #38: When installing composefs images to btrfs targets with overlay storage
 // driver, the entire scratch directory was mounted to /var/tmp. On btrfs-on-LUKS
@@ -20,8 +21,14 @@ import (
 //	"failed to invoke method OpenImage: open /var/tmp/oci-cache/index.json: no such file"
 //
 // The fix mounts the OCI cache at containerOCICachePath (/run/fisherman/oci-cache)
-// — a dedicated path under /run that avoids /var/tmp interactions — and keeps
-// --tmpfs /var/tmp for bootc's own ephemeral scratch space.
+// — a dedicated path under /run that avoids /var/tmp interactions.
+//
+// Issue #20: even with the OCI cache at a dedicated mount, bootc's internal
+// containers/storage writes layer blobs to its (hardcoded) temp dir /var/tmp
+// (e.g. /var/tmp/container_images_storage*/…). With /var/tmp on a tmpfs that
+// fills up → ENOSPC on multi-GiB composefs images. Because the OCI cache is no
+// longer nested inside /var/tmp, the scratch dir can now be bind-mounted at
+// /var/tmp again, giving bootc disk-backed scratch for its blob staging.
 func TestComposeFsMountStrategy_Issue38(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -77,15 +84,14 @@ func TestComposeFsMountStrategy_Issue38(t *testing.T) {
 		t.Errorf("podman command missing %q\ngot: %s", wantSourceImgref, output)
 	}
 
-	// --tmpfs /var/tmp must be present.
-	if !strings.Contains(output, "--tmpfs /var/tmp") {
-		t.Errorf("podman command missing '--tmpfs /var/tmp'\ngot: %s", output)
+	// /var/tmp must be disk-backed (scratch bind-mount), not a tmpfs — otherwise
+	// bootc's internal blob staging fills /var/tmp and fails with ENOSPC (#20).
+	scratchMount := scratchDir + ":/var/tmp"
+	if !strings.Contains(output, scratchMount) {
+		t.Errorf("podman command missing disk-backed scratch mount %q\ngot: %s", scratchMount, output)
 	}
-
-	// Must NOT mount the old full scratch dir at /var/tmp.
-	oldMount := scratchDir + ":/var/tmp"
-	if strings.Contains(output, oldMount) {
-		t.Errorf("podman command contains old broken scratch mount %q\ngot: %s", oldMount, output)
+	if strings.Contains(output, "--tmpfs /var/tmp") {
+		t.Errorf("podman command still uses '--tmpfs /var/tmp' (ENOSPC on multi-GiB images)\ngot: %s", output)
 	}
 }
 
@@ -122,13 +128,18 @@ func TestComposeFsVsStandardMountSeparation(t *testing.T) {
 	io.Copy(&composefsBuf, r) //nolint:errcheck
 	composefsOut := composefsBuf.String()
 
-	// Composefs must NOT use scratch:/var/tmp mount (old broken pattern).
-	if strings.Contains(composefsOut, scratchDir+":/var/tmp") {
-		t.Errorf("composefs path uses old scratch:/var/tmp mount: %s", composefsOut)
+	// Composefs must use scratch:/var/tmp so bootc's blob-staging temp dir is
+	// disk-backed (ENOSPC fix for #20), and must use the dedicated
+	// /run/fisherman/oci-cache path (#38) rather than hiding the cache under
+	// /var/tmp/oci-cache.
+	if !strings.Contains(composefsOut, scratchDir+":/var/tmp") {
+		t.Errorf("composefs path missing disk-backed scratch:/var/tmp mount (%s)", composefsOut)
 	}
-	// Composefs must use the dedicated /run/fisherman/oci-cache path.
 	if !strings.Contains(composefsOut, "/run/fisherman/oci-cache") {
 		t.Errorf("composefs path missing /run/fisherman/oci-cache: %s", composefsOut)
+	}
+	if strings.Contains(composefsOut, "--tmpfs /var/tmp") {
+		t.Errorf("composefs path uses --tmpfs /var/tmp (causes ENOSPC): %s", composefsOut)
 	}
 
 	// Standard (non-composefs) install should still use scratch:/var/tmp.
