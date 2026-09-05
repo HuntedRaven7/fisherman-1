@@ -10,54 +10,75 @@ import (
 	"github.com/tuna-os/fisherman/internal/install"
 )
 
+// allowRegistryPull forces the host-filesystem live-ISO probe off so CheckImage
+// tests exercise the registry/local comparison regardless of the runner's own
+// /var filesystem type (which may be overlayfs/tmpfs in CI containers).
+func allowRegistryPull(t *testing.T) {
+	t.Helper()
+	install.HostVarConstrainedFn = func() bool { return false }
+	t.Cleanup(func() { install.HostVarConstrainedFn = install.DefaultHostVarConstrained })
+}
+
 func TestCheckImage_NeedsPullWhenNotCached(t *testing.T) {
+	allowRegistryPull(t)
 	call := 0
 	install.SkopeoInspectFn = func(args ...string) ([]byte, error) {
 		call++
 		if call == 1 {
-			// Remote inspect: return manifest with digest + layers
-			return []byte(`{"Digest":"sha256:aaaa","Layers":["sha256:l1","sha256:l2"]}`), nil
+			// Local must be probed first…
+			if len(args) == 0 || !strings.HasPrefix(args[0], "containers-storage:") {
+				t.Errorf("local containers-storage must be checked first, got: %v", args)
+			}
+			// …and is not found here.
+			return nil, fmt.Errorf("image not known")
 		}
-		// Local inspect: not found
-		return nil, fmt.Errorf("image not known")
+		// Remote inspect: reachable, return manifest with digest + layers
+		return []byte(`{"Digest":"sha256:aaaa","Layers":["sha256:l1","sha256:l2"]}`), nil
 	}
 	defer func() { install.SkopeoInspectFn = install.DefaultSkopeoInspect }()
 
 	result := install.CheckImage("ghcr.io/tuna-os/yellowfin:gnome-hwe")
 	if !result.NeedsPull {
-		t.Error("NeedsPull should be true when image not in local storage")
+		t.Error("NeedsPull should be true when no local copy but the registry is reachable")
 	}
 	if result.LayerCount != 2 {
 		t.Errorf("LayerCount = %d, want 2", result.LayerCount)
 	}
 }
 
-func TestCheckImage_NoPullWhenCachedAndCurrent(t *testing.T) {
+func TestCheckImage_UseLocalCopyWhenCached(t *testing.T) {
+	allowRegistryPull(t)
 	install.SkopeoInspectFn = func(args ...string) ([]byte, error) {
-		// Both remote and local return same digest
+		if strings.HasPrefix(args[0], "docker://") {
+			t.Errorf("registry must not be probed when a local copy exists, got: %v", args)
+			return nil, fmt.Errorf("registry must not be contacted")
+		}
 		return []byte(`{"Digest":"sha256:bbbb","Layers":["sha256:l1","sha256:l2","sha256:l3"]}`), nil
 	}
 	defer func() { install.SkopeoInspectFn = install.DefaultSkopeoInspect }()
 
 	result := install.CheckImage("ghcr.io/tuna-os/yellowfin:gnome-hwe")
 	if result.NeedsPull {
-		t.Error("NeedsPull should be false when local digest matches remote")
+		t.Error("NeedsPull should be false when a local copy exists")
 	}
 	if result.LayerCount != 3 {
 		t.Errorf("LayerCount = %d, want 3", result.LayerCount)
 	}
+	if result.Offline {
+		t.Error("Offline should be false: registry reachability is irrelevant when local copy exists")
+	}
 }
 
 func TestCheckImage_LocalImagePreferredOverNewer(t *testing.T) {
-	// When the local image exists but has a different digest than the remote
+	allowRegistryPull(t)
+	// When a local copy exists but has a different digest than the remote
 	// (i.e. remote is newer), we still use the local image.  The ISO embeds
 	// a specific image version for offline install; post-install updates are
 	// handled by `bootc update`, not by re-pulling during installation.
-	call := 0
 	install.SkopeoInspectFn = func(args ...string) ([]byte, error) {
-		call++
-		if call == 1 {
-			return []byte(`{"Digest":"sha256:remote-newer","Layers":["sha256:l1"]}`), nil
+		if strings.HasPrefix(args[0], "docker://") {
+			t.Errorf("registry must not be probed when a local copy exists, got: %v", args)
+			return nil, fmt.Errorf("registry must not be contacted")
 		}
 		return []byte(`{"Digest":"sha256:local-embedded","Layers":["sha256:l1"]}`), nil
 	}
@@ -65,50 +86,64 @@ func TestCheckImage_LocalImagePreferredOverNewer(t *testing.T) {
 
 	result := install.CheckImage("ghcr.io/tuna-os/yellowfin:gnome-hwe")
 	if result.NeedsPull {
-		t.Error("NeedsPull should be false when local image exists, even if remote is newer")
+		t.Error("NeedsPull should be false when a local copy exists, even if remote is newer")
 	}
 	if result.Offline {
 		t.Error("Offline should be false when remote is reachable")
 	}
 }
 
-func TestCheckImage_NeedsPullOnNetworkErrorNoCachedImage(t *testing.T) {
+func TestCheckImage_UnreachableRegistryNoLocalCopyDoesNotPull(t *testing.T) {
+	allowRegistryPull(t)
 	install.SkopeoInspectFn = func(args ...string) ([]byte, error) {
 		return nil, fmt.Errorf("network error")
 	}
 	defer func() { install.SkopeoInspectFn = install.DefaultSkopeoInspect }()
 
 	result := install.CheckImage("ghcr.io/tuna-os/yellowfin:gnome-hwe")
-	if !result.NeedsPull {
-		t.Error("NeedsPull should be true when offline and image not in local storage")
+	if result.NeedsPull {
+		t.Error("NeedsPull should be false when no local copy exists and the registry is unreachable: a pull would be doomed")
 	}
-	if result.Offline {
-		t.Error("Offline should be false when image is not in local storage")
+	if !result.Offline {
+		t.Error("Offline should be true when no local copy exists and the registry is unreachable")
 	}
 }
 
-func TestCheckImage_OfflineWithLocalCache(t *testing.T) {
-	call := 0
+func TestCheckImage_LiveEnvironmentNeverPulls(t *testing.T) {
+	install.HostVarConstrainedFn = func() bool { return true }
+	defer func() { install.HostVarConstrainedFn = install.DefaultHostVarConstrained }()
+
+	// On a live host the registry must never be probed; only local storage.
 	install.SkopeoInspectFn = func(args ...string) ([]byte, error) {
-		call++
-		if call == 1 {
-			// Remote inspect: offline / unreachable
-			return nil, fmt.Errorf("network unreachable")
+		if len(args) > 0 && strings.HasPrefix(args[0], "docker://") {
+			t.Errorf("live-host CheckImage must not probe the registry, got: %v", args)
+			return nil, fmt.Errorf("registry must not be contacted")
 		}
-		// Local inspect: image is cached
-		return []byte(`{"Digest":"sha256:cached","Layers":["sha256:l1","sha256:l2","sha256:l3"]}`), nil
+		return []byte(`{"Digest":"sha256:local","Layers":["sha256:l1","sha256:l2"]}`), nil
 	}
 	defer func() { install.SkopeoInspectFn = install.DefaultSkopeoInspect }()
 
 	result := install.CheckImage("ghcr.io/tuna-os/yellowfin:gnome-hwe")
 	if result.NeedsPull {
-		t.Error("NeedsPull should be false when offline but image is in local storage")
+		t.Error("NeedsPull should be false on a live host even when the registry would otherwise require it")
 	}
-	if !result.Offline {
-		t.Error("Offline should be true when registry was unreachable")
+	if result.LayerCount != 2 {
+		t.Errorf("LayerCount = %d, want 2", result.LayerCount)
 	}
-	if result.LayerCount != 3 {
-		t.Errorf("LayerCount = %d, want 3", result.LayerCount)
+}
+
+func TestCheckImage_LiveEnvironmentMissingLocalDoesNotPull(t *testing.T) {
+	install.HostVarConstrainedFn = func() bool { return true }
+	defer func() { install.HostVarConstrainedFn = install.DefaultHostVarConstrained }()
+
+	install.SkopeoInspectFn = func(args ...string) ([]byte, error) {
+		return nil, fmt.Errorf("not found locally")
+	}
+	defer func() { install.SkopeoInspectFn = install.DefaultSkopeoInspect }()
+
+	result := install.CheckImage("ghcr.io/tuna-os/yellowfin:gnome-hwe")
+	if result.NeedsPull {
+		t.Error("NeedsPull should stay false on a live host: the embedded image is the only valid source")
 	}
 }
 

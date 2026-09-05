@@ -366,9 +366,12 @@ func bootcViaContainer(opts Options) error {
 			if err := os.RemoveAll(nonComposefsRoot); err != nil && !os.IsNotExist(err) {
 				progress.Substep(fmt.Sprintf("Warning: could not clear previous podman database: %v", err))
 			}
-			// Only re-pull when the source is a registry URL.  containers-storage:
-			// images are already local; they get exported to OCI layout instead.
-			if !strings.HasPrefix(opts.SourceImgref, "containers-storage:") {
+			// Only re-pull when the source is a registry URL and we are not on
+			// a live ISO.  containers-storage: images are already local; they
+			// get exported to OCI layout instead.  Live-ISO hosts (/var on
+			// tmpfs/overlayfs) ship the image embedded and must never pull
+			// from the registry — the pull would fill the writable overlay.
+			if !strings.HasPrefix(opts.SourceImgref, "containers-storage:") && !HostVarConstrainedFn() {
 				opts.NeedsPull = true
 			}
 		} else {
@@ -1053,57 +1056,74 @@ func DefaultSkopeoInspect(args ...string) ([]byte, error) {
 // Replace in tests to avoid network calls.
 var SkopeoInspectFn = DefaultSkopeoInspect
 
-// CheckImage compares the remote and local (containers-storage) image digests
-// to determine whether a pull is required. It also returns the remote layer count.
+// HostVarConstrainedFn reports whether /var lives on a space-constrained
+// filesystem (tmpfs/overlayfs), which identifies a live-ISO environment.
+// On such hosts the install image is embedded in the ISO and a registry pull
+// would fill the tiny writable overlay — so fisherman must use the local copy
+// and never pull. Overridable in tests.
+var HostVarConstrainedFn = DefaultHostVarConstrained
+
+// DefaultHostVarConstrained is the default implementation of
+// HostVarConstrainedFn: a filesystem-type probe of /var. Mirrors the
+// isSpaceConstrained("/var") live-environment check in cmd/fisherman.
+func DefaultHostVarConstrained() bool {
+	ft, err := filesystemType("/var")
+	if err != nil {
+		return false
+	}
+	return ft == "tmpfs" || ft == "overlayfs"
+}
+
+// CheckImage decides whether a registry pull is required for image.
 //
-// If the remote registry is unreachable (offline), CheckImage falls back to
-// checking local containers-storage: if the image is present locally it is used
-// as-is (NeedsPull=false, Offline=true). This allows a full offline install when
-// the image has been pre-pulled into podman storage.
+// The local containers-storage copy always wins: the installer's job is to
+// deploy the embedded/pre-pulled image, and post-install updates are handled
+// by `bootc update`. We only reach for the registry when there is no usable
+// local copy AND the registry actually answers — an unreachable registry makes
+// a pull attempt doomed, so that is reported as no-pull instead.
+//
+// If the remote registry is unreachable (offline), CheckImage defers to local
+// containers-storage: if the image is present locally it is used as-is
+// (NeedsPull=false, Offline=true). This allows a full offline install when the
+// image has been pre-pulled into podman storage.
 func CheckImage(image string) ImageCheck {
 	type manifest struct {
 		Digest string   `json:"Digest"`
 		Layers []string `json:"Layers"`
 	}
 
-	// 1. Fetch remote normalized manifest (resolves fat/multi-arch manifests).
-	remoteOut, remoteErr := SkopeoInspectFn("docker://" + bareImageRef(image))
-
-	// 2. Fetch local digest from containers-storage.
+	// 1. Local containers-storage copy wins. Never contact the registry when a
+	// usable local copy exists.
 	localOut, localErr := SkopeoInspectFn("containers-storage:" + bareImageRef(image))
-
-	// If offline (remote failed), fall back to the locally cached image.
-	if remoteErr != nil {
-		if localErr == nil {
-			var local manifest
-			if json.Unmarshal(localOut, &local) == nil {
-				return ImageCheck{NeedsPull: false, LayerCount: len(local.Layers), Offline: true}
-			}
+	if localErr == nil {
+		var local manifest
+		if json.Unmarshal(localOut, &local) == nil {
+			return ImageCheck{NeedsPull: false, LayerCount: len(local.Layers)}
 		}
-		// Not reachable and not cached locally; a pull attempt will follow (and fail).
-		return ImageCheck{NeedsPull: true}
 	}
 
+	// 2. Live-ISO hosts (/var on tmpfs/overlayfs) ship the image embedded in
+	// the ISO. Pulling from the registry would fill the space-constrained
+	// writable overlay, so never pull — fail fast on the local copy instead.
+	if HostVarConstrainedFn() {
+		return ImageCheck{NeedsPull: false, Offline: true}
+	}
+
+	// 3. No usable local copy: pull only when the registry answers (resolves
+	// fat/multi-arch manifests and doubles as the reachability probe). If it is
+	// unreachable the pull is doomed; defer to the local copy, which will
+	// surface a clear error if it is truly absent.
+	remoteOut, remoteErr := SkopeoInspectFn("docker://" + bareImageRef(image))
+	if remoteErr != nil {
+		return ImageCheck{NeedsPull: false, Offline: true}
+	}
 	var remote manifest
 	if err := json.Unmarshal(remoteOut, &remote); err != nil {
 		return ImageCheck{NeedsPull: true}
 	}
 
-	// Image not present locally: pull needed.
-	if localErr != nil {
-		return ImageCheck{NeedsPull: true, LayerCount: len(remote.Layers)}
-	}
-	var local manifest
-	if err := json.Unmarshal(localOut, &local); err != nil {
-		return ImageCheck{NeedsPull: true, LayerCount: len(remote.Layers)}
-	}
-
-	// 3. Image is present locally — always use it.
-	// The installer's job is to deploy the embedded image; post-install
-	// updates are handled by `bootc update`.  Pulling a newer image during
-	// install would exceed the live-ISO's scratch space and defeats the
-	// purpose of embedding the image in the ISO in the first place.
-	return ImageCheck{NeedsPull: false, LayerCount: len(local.Layers)}
+	// 3b. Registry reachable and no local copy: pull needed.
+	return ImageCheck{NeedsPull: true, LayerCount: len(remote.Layers)}
 }
 
 // runWithSubsteps runs a command, relays its combined stdout/stderr line-by-line
