@@ -467,10 +467,14 @@ func bootcViaContainer(opts Options) error {
 		// path below, so bind-mounting the whole scratch dir at /var/tmp does
 		// not hide the cache (the original bug in #38).
 		podmanArgs = append(podmanArgs, "-v", scratch+":/var/tmp:z")
+		podmanArgs = append(podmanArgs, "-v", scratch+":/tmp:z")
+		podmanArgs = append(podmanArgs, "-e", "TMPDIR=/var/tmp")
 		podmanArgs = append(podmanArgs,
 			"-v", ociCacheHost+":"+containerOCICachePath+":ro")
 	} else {
 		podmanArgs = append(podmanArgs, "-v", scratch+":/var/tmp:z")
+		podmanArgs = append(podmanArgs, "-v", scratch+":/tmp:z")
+		podmanArgs = append(podmanArgs, "-e", "TMPDIR=/var/tmp")
 	}
 
 	podmanArgs = append(podmanArgs,
@@ -621,12 +625,18 @@ func bootcToDiskViaContainer(opts Options, diskDevice, filesystem string) (effec
 	}
 
 	// Both composefs and non-composefs installs need disk-backed /var/tmp
-	// inside the bootc container: containers/storage hardcodes its
+	// and /tmp inside the bootc container: containers/storage hardcodes its
 	// blob-staging TMPDir to /var/tmp (e.g. /var/tmp/container_images_storage*/),
-	// so a tmpfs here fills up and fails with ENOSPC on multi-GiB images.
+	// but the storage.conf tmpdir or $TMPDIR may redirect to /tmp, which is
+	// typically a tmpfs on live ISOs. Bind-mounting scratch at both paths and
+	// setting TMPDIR=/var/tmp ensures ENOSPC never hits a tmpfs during
+	// multi-GiB blob staging.
 	// The OCI cache is mounted at the dedicated /run/fisherman/oci-cache path,
-	// so mounting the whole scratch dir at /var/tmp does not hide the cache.
+	// so mounting the whole scratch dir at /var/tmp and /tmp does not hide
+	// the cache.
 	podmanArgs = append(podmanArgs, "-v", scratch+":/var/tmp:z")
+	podmanArgs = append(podmanArgs, "-v", scratch+":/tmp:z")
+	podmanArgs = append(podmanArgs, "-e", "TMPDIR=/var/tmp")
 
 	if opts.ComposeFsBackend {
 		// composefs-backend requires raw OCI blobs (compressed layer tarballs)

@@ -84,14 +84,25 @@ func TestComposeFsMountStrategy_Issue38(t *testing.T) {
 		t.Errorf("podman command missing %q\ngot: %s", wantSourceImgref, output)
 	}
 
-	// /var/tmp must be disk-backed (scratch bind-mount), not a tmpfs — otherwise
-	// bootc's internal blob staging fills /var/tmp and fails with ENOSPC (#20).
+	// /var/tmp and /tmp must be disk-backed (scratch bind-mount), not a tmpfs
+	// — otherwise bootc's internal blob staging fills them and fails with
+	// ENOSPC (#20). TMPDIR=/var/tmp forces containers/storage onto /var/tmp.
 	scratchMount := scratchDir + ":/var/tmp"
 	if !strings.Contains(output, scratchMount) {
 		t.Errorf("podman command missing disk-backed scratch mount %q\ngot: %s", scratchMount, output)
 	}
+	tmpMount := scratchDir + ":/tmp"
+	if !strings.Contains(output, tmpMount) {
+		t.Errorf("podman command missing disk-backed scratch mount %q\ngot: %s", tmpMount, output)
+	}
+	if !strings.Contains(output, "-e TMPDIR=/var/tmp") {
+		t.Errorf("podman command missing TMPDIR=/var/tmp env var\ngot: %s", output)
+	}
 	if strings.Contains(output, "--tmpfs /var/tmp") {
 		t.Errorf("podman command still uses '--tmpfs /var/tmp' (ENOSPC on multi-GiB images)\ngot: %s", output)
+	}
+	if strings.Contains(output, "--tmpfs /tmp") {
+		t.Errorf("podman command still uses '--tmpfs /tmp' (ENOSPC on multi-GiB images)\ngot: %s", output)
 	}
 }
 
@@ -131,9 +142,16 @@ func TestComposeFsVsStandardMountSeparation(t *testing.T) {
 	// Composefs must use scratch:/var/tmp so bootc's blob-staging temp dir is
 	// disk-backed (ENOSPC fix for #20), and must use the dedicated
 	// /run/fisherman/oci-cache path (#38) rather than hiding the cache under
-	// /var/tmp/oci-cache.
+	// /var/tmp/oci-cache. /tmp must also be disk-backed and TMPDIR must point
+	// to /var/tmp so containers/storage never falls back to a tmpfs.
 	if !strings.Contains(composefsOut, scratchDir+":/var/tmp") {
 		t.Errorf("composefs path missing disk-backed scratch:/var/tmp mount (%s)", composefsOut)
+	}
+	if !strings.Contains(composefsOut, scratchDir+":/tmp") {
+		t.Errorf("composefs path missing disk-backed scratch:/tmp mount (%s)", composefsOut)
+	}
+	if !strings.Contains(composefsOut, "-e TMPDIR=/var/tmp") {
+		t.Errorf("composefs path missing TMPDIR=/var/tmp env var (%s)", composefsOut)
 	}
 	if !strings.Contains(composefsOut, "/run/fisherman/oci-cache") {
 		t.Errorf("composefs path missing /run/fisherman/oci-cache: %s", composefsOut)
@@ -141,8 +159,12 @@ func TestComposeFsVsStandardMountSeparation(t *testing.T) {
 	if strings.Contains(composefsOut, "--tmpfs /var/tmp") {
 		t.Errorf("composefs path uses --tmpfs /var/tmp (causes ENOSPC): %s", composefsOut)
 	}
+	if strings.Contains(composefsOut, "--tmpfs /tmp") {
+		t.Errorf("composefs path uses --tmpfs /tmp (causes ENOSPC): %s", composefsOut)
+	}
 
-	// Standard (non-composefs) install should still use scratch:/var/tmp.
+	// Standard (non-composefs) install should still use scratch:/var/tmp and
+	// scratch:/tmp with TMPDIR=/var/tmp.
 	r2, w2, _ := os.Pipe()
 	os.Stdout = w2
 	_ = install.BootcInstall(install.Options{
@@ -160,6 +182,12 @@ func TestComposeFsVsStandardMountSeparation(t *testing.T) {
 
 	if !strings.Contains(standardOut, scratchDir+":/var/tmp") {
 		t.Errorf("standard path missing scratch:/var/tmp mount: %s", standardOut)
+	}
+	if !strings.Contains(standardOut, scratchDir+":/tmp") {
+		t.Errorf("standard path missing scratch:/tmp mount: %s", standardOut)
+	}
+	if !strings.Contains(standardOut, "-e TMPDIR=/var/tmp") {
+		t.Errorf("standard path missing TMPDIR=/var/tmp env var: %s", standardOut)
 	}
 }
 
