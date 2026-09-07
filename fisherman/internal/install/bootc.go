@@ -145,6 +145,20 @@ func (o Options) scratchDir() string {
 // btrfs-on-LUKS that made the cache invisible under /var/tmp (see #38).
 const containerOCICachePath = "/run/fisherman/oci-cache"
 
+// containerScratchTmpPath is the container-side path where the disk-backed
+// scratch dir is bound for containers/storage blob staging. containers/storage
+// defaults its TmpDir to /var/tmp and stages multi-GiB layer blobs there
+// (e.g. /var/tmp/container_images_storage*/63); on a live ISO that path is
+// fatal because bootc's install preflight re-mirrors the HOST's /var/tmp over
+// the container's (ensure_mirrored_host_mount, comparing statvfs f_fsid
+// against /proc/1/root/var/tmp via the host PID namespace) and on a live ISO
+// the host /var/tmp is the tiny dracut overlay (~1.4 GiB), so staging there
+// fails with ENOSPC (#20/#21). Likewise /tmp is replaced by a fresh tmpfs
+// (setup_tmp_mount), so neither /var/tmp nor /tmp can host big blobs. This
+// path is mounted away from both, so a storage.conf tmpdir pointing at it keeps
+// blob staging disk-backed no matter what bootc does to /var/tmp and /tmp.
+const containerScratchTmpPath = "/run/fisherman/tmp"
+
 // BuildBootcArgs builds the argument slice for `bootc install to-filesystem`.
 // resolvedTargetImgref is the --target-imgref value (empty to omit the flag).
 // installTarget is the final positional argument (e.g. "/target" in container mode,
@@ -471,6 +485,18 @@ func bootcViaContainer(opts Options) error {
 		podmanArgs = append(podmanArgs, "-e", "TMPDIR=/var/tmp")
 		podmanArgs = append(podmanArgs,
 			"-v", ociCacheHost+":"+containerOCICachePath+":ro")
+		// The /var/tmp and /tmp mounts above are not sufficient on their own:
+		// bootc's install preflight replaces the container's /var/tmp with the
+		// HOST's /var/tmp (ensure_mirrored_host_mount, using the host PID
+		// namespace) and replaces /tmp with a fresh tmpfs (setup_tmp_mount).
+		// On a live ISO the host /var/tmp is the small dracut overlay, so blob
+		// staging still ENOSPCs (#20/#21). Redirect containers/storage's TmpDir
+		// to the dedicated scratch-bound containerScratchTmpPath mount instead.
+		if opts.ComposeFsBackend {
+			var cleanupConf func()
+			podmanArgs, cleanupConf = appendStorageTmpDirArgs(podmanArgs, scratch, containerScratchTmpPath)
+			defer cleanupConf()
+		}
 	} else {
 		podmanArgs = append(podmanArgs, "-v", scratch+":/var/tmp:z")
 		podmanArgs = append(podmanArgs, "-v", scratch+":/tmp:z")
@@ -649,6 +675,13 @@ func bootcToDiskViaContainer(opts Options, diskDevice, filesystem string) (effec
 			return "", fmt.Errorf("exporting image to OCI layout: %w", err)
 		}
 		podmanArgs = append(podmanArgs, "-v", ociDir+":"+containerOCICachePath+":ro")
+		// Same live-ISO ENOSPC defense as bootcViaContainer: bootc's preflight
+		// swaps the container's /var/tmp for the host's (tiny overlay on a live
+		// ISO) and its /tmp for a tmpfs, so redirect containers/storage's blob
+		// staging to the dedicated scratch-bound path.
+		var cleanupConf func()
+		podmanArgs, cleanupConf = appendStorageTmpDirArgs(podmanArgs, scratch, containerScratchTmpPath)
+		defer cleanupConf()
 		bootcArgs = append(bootcArgs, "--source-imgref", "oci:"+containerOCICachePath)
 		bootcArgs = append(bootcArgs, diskDevice)
 		effectiveDisk = diskDevice
@@ -810,15 +843,6 @@ func injectStorageTmpDir(conf, newLine string) string {
 // /etc/containers/storage.conf), so we supply an explicit config file.
 //
 // The caller must remove the returned path when done.
-// NOTE: currently unreferenced. It arrived in e6ea536 ("override
-// CONTAINERS_STORAGE_CONF tmpdir to prevent ENOSPC on live ISO") and was
-// orphaned by 74993bb, which replaced that approach with a two-stage export.
-// Suppressed rather than deleted because removing code from a path that
-// exists to work around a live-ISO ENOSPC failure is the maintainers' call,
-// not a lint fix — if it is genuinely dead, deleting it is better than this
-// directive.
-//
-//nolint:unused // orphaned by 74993bb; keep or delete is a maintainer decision
 func writeStorageConfWithTmpDir(confDir, scratchDir string) (string, error) {
 	if err := os.MkdirAll(confDir, 0o755); err != nil {
 		return "", err
@@ -853,6 +877,38 @@ func writeStorageConfWithTmpDir(confDir, scratchDir string) (string, error) {
 		return "", err
 	}
 	return f.Name(), nil
+}
+
+// appendStorageTmpDirArgs pins containers/storage's TmpDir to a disk-backed path
+// inside the bootc container by mounting a fisherman-generated storage.conf and
+// forwarding CONTAINERS_STORAGE_CONF.
+//
+// containers/storage defaults TmpDir to /var/tmp and stages multi-GiB layer
+// blobs there (e.g. /var/tmp/container_images_storage*/63). Merely binding the
+// scratch dir at /var/tmp in the container is not enough: bootc's install
+// preflight (ensure_mirrored_host_mount) compares the statvfs f_fsid of the
+// container's /var/tmp with /proc/1/root/var/tmp (the HOST's /var/tmp, reached
+// through the host PID namespace) and, when they differ — which is always the
+// case on a live ISO whose host /var/tmp is the small dracut overlay — replaces
+// the container's /var/tmp with a recursive bind of the host's. Blob staging
+// then ENOSPCs (#20/#21). Pointing a storage.conf tmpdir at the dedicated
+// containerScratchTmpPath mount (a scratch subdir bound away from /var/tmp and
+// /tmp) keeps staging disk-backed regardless of what bootc does to those paths.
+// This is the fix bootc-installer applied in projectbluefin/bootc-installer#188.
+//
+// Returns the new args slice and a cleanup that removes the generated conf.
+// Always safe to defer the cleanup immediately.
+func appendStorageTmpDirArgs(podmanArgs []string, scratch, containerTmpDir string) ([]string, func()) {
+	hostConf, err := writeStorageConfWithTmpDir(filepath.Join(scratch, "fisherman-conf"), containerTmpDir)
+	if err != nil {
+		progress.Info(fmt.Sprintf("warning: could not write storage.conf tmpdir override: %v", err))
+		return podmanArgs, func() {}
+	}
+	podmanArgs = append(podmanArgs,
+		"-v", scratch+":"+containerTmpDir+":z",
+		"-v", hostConf+":/etc/containers/storage.conf:ro",
+		"-e", "CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf")
+	return podmanArgs, func() { os.Remove(hostConf) }
 }
 
 // skopeoExportOCI exports an image from containers-storage to an OCI directory

@@ -96,3 +96,39 @@ func TestAppendImageStoreArgs_CallerEnvWins(t *testing.T) {
 		t.Errorf("auto-generated conf should be skipped when caller env wins; got %d entries", len(entries))
 	}
 }
+
+// TestAppendStorageTmpDirArgs verifies the #20/#21 fix wiring: the podman args
+// get a scratch-backed bind at containerScratchTmpPath, a storage.conf mount,
+// and CONTAINERS_STORAGE_CONF, and the generated conf pins tmpdir to the
+// container-side staging path (so bootc's containers/storage blob staging never
+// lands on the live-ISO host /var/tmp that bootc mirrors into the container).
+func TestAppendStorageTmpDirArgs(t *testing.T) {
+	scratch := t.TempDir()
+	out, cleanup := appendStorageTmpDirArgs(nil, scratch, containerScratchTmpPath)
+	defer cleanup()
+
+	joined := strings.Join(out, " ")
+	for _, want := range []string{
+		scratch + ":" + containerScratchTmpPath + ":z",
+		"/etc/containers/storage.conf:ro",
+		"CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("podman args missing %q; got: %v", want, out)
+		}
+	}
+
+	// The generated conf must pin tmpdir to the container-side staging path.
+	confDir := scratch + "/fisherman-conf"
+	entries, err := os.ReadDir(confDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected exactly one generated conf in %s; got %v err=%v", confDir, entries, err)
+	}
+	body, err := os.ReadFile(confDir + "/" + entries[0].Name())
+	if err != nil {
+		t.Fatalf("reading generated conf: %v", err)
+	}
+	if !strings.Contains(string(body), `tmpdir = "`+containerScratchTmpPath+`"`) {
+		t.Errorf("generated conf missing tmpdir override; body=%q", body)
+	}
+}

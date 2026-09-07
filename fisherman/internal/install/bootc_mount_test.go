@@ -11,12 +11,80 @@ import (
 	"github.com/tuna-os/fisherman/internal/install"
 )
 
+// TestComposeFsMountStrategy_StorageConfTmpDir is a regression test for #20/#21.
+//
+// Even with scratch bind-mounted at /var/tmp (and /tmp) in the bootc container,
+// the install preflight hijacks the container's /var/tmp: bootc compares the
+// statvfs f_fsid of the container /var/tmp against /proc/1/root/var/tmp (the
+// HOST /var/tmp, visible because fisherman runs podman with --pid=host) and,
+// on a live ISO those differ, so it replaces the disk-backed scratch bind with a
+// recursive bind of the host's tiny dracut overlay. Blob staging at
+// /var/tmp/container_images_storage* then ENOSPCs on multi-GiB composefs images.
+//
+// The fix redirects containers/storage's TmpDir to a dedicated scratch-bound
+// mount (containerScratchTmpPath) via a storage.conf + CONTAINERS_STORAGE_CONF,
+// exactly as bootc-installer did in projectbluefin/bootc-installer#188.
+func TestComposeFsMountStrategy_StorageConfTmpDir(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	install.SkopeoExportOCIFn = func(image, destDir, tmpdir string) error {
+		return os.MkdirAll(destDir, 0755)
+	}
+	t.Cleanup(func() { install.SkopeoExportOCIFn = install.DefaultSkopeoExportOCI })
+
+	scratchDir := filepath.Join(tmpDir, "scratch")
+	if err := os.MkdirAll(scratchDir, 0755); err != nil {
+		t.Fatalf("mkdir scratch: %v", err)
+	}
+	target := filepath.Join(tmpDir, "target")
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = w
+
+	_ = install.BootcInstall(install.Options{
+		ComposeFsBackend: true,
+		SourceImgref:     "containers-storage:ghcr.io/projectbluefin/dakota:latest",
+		TargetImgref:     "ghcr.io/projectbluefin/dakota:latest",
+		Target:           target,
+		ScratchDir:       scratchDir,
+		NeedsPull:        false,
+	})
+
+	w.Close()
+	os.Stdout = oldStdout
+	var buf bytes.Buffer
+	io.Copy(&buf, r) //nolint:errcheck
+	output := buf.String()
+
+	// containers/storage's TmpDir must be pinned to a scratch-backed path that
+	// bootc does NOT hijack (neither /var/tmp nor /tmp).
+	wantBind := scratchDir + ":/run/fisherman/tmp:z"
+	if !strings.Contains(output, wantBind) {
+		t.Errorf("podman command missing disk-backed staging bind %q\ngot: %s", wantBind, output)
+	}
+	// A storage.conf with tmpdir is mounted and forwarded to containers/storage.
+	if !strings.Contains(output, "/etc/containers/storage.conf:ro") {
+		t.Errorf("podman command missing storage.conf mount\ngot: %s", output)
+	}
+	if !strings.Contains(output, "-e CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf") {
+		t.Errorf("podman command missing CONTAINERS_STORAGE_CONF env\ngot: %s", output)
+	}
+}
+
 // TestComposeFsMountStrategy_Issue38 is a regression test for issue #38,
 // updated for issue #20.
 //
-// Issue #38: When installing composefs images to btrfs targets with overlay storage
-// driver, the entire scratch directory was mounted to /var/tmp. On btrfs-on-LUKS
-// targets this caused the OCI cache to be invisible inside the bootc container:
+// Issue #38: When installing composefs images to btrfs targets with overlay
+// storage driver, the entire scratch directory was mounted to /var/tmp. On
+// btrfs-on-LUKS targets this caused the OCI cache to be invisible inside the
+// bootc container:
 //
 //	"failed to invoke method OpenImage: open /var/tmp/oci-cache/index.json: no such file"
 //
