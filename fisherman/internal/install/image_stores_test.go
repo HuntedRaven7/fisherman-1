@@ -2,6 +2,7 @@ package install
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -97,38 +98,21 @@ func TestAppendImageStoreArgs_CallerEnvWins(t *testing.T) {
 	}
 }
 
-// TestAppendStorageTmpDirArgs verifies the #20/#21 fix wiring: the podman args
-// get a scratch-backed bind at containerScratchTmpPath, a storage.conf mount,
-// and CONTAINERS_STORAGE_CONF, and the generated conf pins tmpdir to the
-// container-side staging path (so bootc's containers/storage blob staging never
-// lands on the live-ISO host /var/tmp that bootc mirrors into the container).
-func TestAppendStorageTmpDirArgs(t *testing.T) {
+// TestVarTmpOverrideHelpers sanity-checks the host /var/tmp override plumbing:
+// the override directory path derivation and the idempotence probe that stops
+// the whole-install binder and skopeoExportOCI from stacking bind mounts.
+func TestVarTmpOverrideHelpers(t *testing.T) {
 	scratch := t.TempDir()
-	out, cleanup := appendStorageTmpDirArgs(nil, scratch, containerScratchTmpPath)
-	defer cleanup()
-
-	joined := strings.Join(out, " ")
-	for _, want := range []string{
-		scratch + ":" + containerScratchTmpPath + ":z",
-		"/etc/containers/storage.conf:ro",
-		"CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Errorf("podman args missing %q; got: %v", want, out)
-		}
+	override := varTmpOverrideDir(scratch)
+	if override != filepath.Join(scratch, "var-tmp-override") {
+		t.Errorf("varTmpOverrideDir = %q, want %q", override, filepath.Join(scratch, "var-tmp-override"))
 	}
-
-	// The generated conf must pin tmpdir to the container-side staging path.
-	confDir := scratch + "/fisherman-conf"
-	entries, err := os.ReadDir(confDir)
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("expected exactly one generated conf in %s; got %v err=%v", confDir, entries, err)
+	if err := os.MkdirAll(override, 0o1777); err != nil {
+		t.Fatal(err)
 	}
-	body, err := os.ReadFile(confDir + "/" + entries[0].Name())
-	if err != nil {
-		t.Fatalf("reading generated conf: %v", err)
-	}
-	if !strings.Contains(string(body), `tmpdir = "`+containerScratchTmpPath+`"`) {
-		t.Errorf("generated conf missing tmpdir override; body=%q", body)
+	// /var/tmp is real dir on a real filesystem, override is a fresh dir on
+	// another (t.TempDir) filesystem → must not be reported as bound.
+	if hostVarTmpBound(override) {
+		t.Error("hostVarTmpBound(true) before any bind; is /var/tmp really an alias of the override dir?")
 	}
 }

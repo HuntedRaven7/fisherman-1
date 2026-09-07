@@ -11,20 +11,25 @@ import (
 	"github.com/tuna-os/fisherman/internal/install"
 )
 
-// TestComposeFsMountStrategy_StorageConfTmpDir is a regression test for #20/#21.
+// TestComposeFsMountStrategy_HostVarTmpBound is a regression test for #20/#21.
 //
 // Even with scratch bind-mounted at /var/tmp (and /tmp) in the bootc container,
 // the install preflight hijacks the container's /var/tmp: bootc compares the
 // statvfs f_fsid of the container /var/tmp against /proc/1/root/var/tmp (the
 // HOST /var/tmp, visible because fisherman runs podman with --pid=host) and,
 // on a live ISO those differ, so it replaces the disk-backed scratch bind with a
-// recursive bind of the host's tiny dracut overlay. Blob staging at
-// /var/tmp/container_images_storage* then ENOSPCs on multi-GiB composefs images.
+// recursive bind of the host's tiny dracut overlay. Meanwhile containers/image
+// hardcodes /var/tmp for its multi-GiB big-file staging, so a storage.conf
+// tmpdir cannot redirect it (the old f384208f approach): the timestamped env
+// verification on PR #21 showed blobs still landing at
+// /var/tmp/container_images_storage* and ENOSPCing.
 //
-// The fix redirects containers/storage's TmpDir to a dedicated scratch-bound
-// mount (containerScratchTmpPath) via a storage.conf + CONTAINERS_STORAGE_CONF,
-// exactly as bootc-installer did in projectbluefin/bootc-installer#188.
-func TestComposeFsMountStrategy_StorageConfTmpDir(t *testing.T) {
+// The fix engages HostVarTmpBindFn — a whole-install bind of the disk-backed
+// scratch's var-tmp-override subdir over the HOST /var/tmp in the host mount
+// namespace — so whichever /var/tmp bootc ends up using is disk-backed. The
+// container-side scratch:/var/tmp, /tmp and TMPDIR mounts remain as belt-and-
+// braces for processes outside bootc's mirroring path.
+func TestComposeFsMountStrategy_HostVarTmpBound(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	install.SkopeoExportOCIFn = func(image, destDir, tmpdir string) error {
@@ -40,6 +45,8 @@ func TestComposeFsMountStrategy_StorageConfTmpDir(t *testing.T) {
 	if err := os.MkdirAll(target, 0755); err != nil {
 		t.Fatalf("mkdir target: %v", err)
 	}
+
+	gotScratch := stubHostVarTmpBind(t)
 
 	oldStdout := os.Stdout
 	r, w, err := os.Pipe()
@@ -63,18 +70,22 @@ func TestComposeFsMountStrategy_StorageConfTmpDir(t *testing.T) {
 	io.Copy(&buf, r) //nolint:errcheck
 	output := buf.String()
 
-	// containers/storage's TmpDir must be pinned to a scratch-backed path that
-	// bootc does NOT hijack (neither /var/tmp nor /tmp).
-	wantBind := scratchDir + ":/run/fisherman/tmp:z"
-	if !strings.Contains(output, wantBind) {
-		t.Errorf("podman command missing disk-backed staging bind %q\ngot: %s", wantBind, output)
+	// The host /var/tmp binder must be engaged for the composefs container path,
+	// using the same scratch dir that is bind-mounted into the container.
+	if *gotScratch != scratchDir {
+		t.Errorf("HostVarTmpBindFn called with %q, want %q", *gotScratch, scratchDir)
 	}
-	// A storage.conf with tmpdir is mounted and forwarded to containers/storage.
-	if !strings.Contains(output, "/etc/containers/storage.conf:ro") {
-		t.Errorf("podman command missing storage.conf mount\ngot: %s", output)
+	// The container still gets disk-backed /var/tmp, /tmp and TMPDIR.
+	scratchMount := scratchDir + ":/var/tmp"
+	if !strings.Contains(output, scratchMount) {
+		t.Errorf("podman command missing disk-backed scratch mount %q\ngot: %s", scratchMount, output)
 	}
-	if !strings.Contains(output, "-e CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf") {
-		t.Errorf("podman command missing CONTAINERS_STORAGE_CONF env\ngot: %s", output)
+	tmpMount := scratchDir + ":/tmp"
+	if !strings.Contains(output, tmpMount) {
+		t.Errorf("podman command missing disk-backed scratch mount %q\ngot: %s", tmpMount, output)
+	}
+	if !strings.Contains(output, "-e TMPDIR=/var/tmp") {
+		t.Errorf("podman command missing TMPDIR=/var/tmp env var\ngot: %s", output)
 	}
 }
 
@@ -104,6 +115,7 @@ func TestComposeFsMountStrategy_Issue38(t *testing.T) {
 		return os.MkdirAll(destDir, 0755)
 	}
 	t.Cleanup(func() { install.SkopeoExportOCIFn = install.DefaultSkopeoExportOCI })
+	_ = stubHostVarTmpBind(t)
 
 	scratchDir := filepath.Join(tmpDir, "scratch")
 	if err := os.MkdirAll(scratchDir, 0755); err != nil {
@@ -183,6 +195,7 @@ func TestComposeFsVsStandardMountSeparation(t *testing.T) {
 		return os.MkdirAll(destDir, 0755)
 	}
 	t.Cleanup(func() { install.SkopeoExportOCIFn = install.DefaultSkopeoExportOCI })
+	_ = stubHostVarTmpBind(t)
 
 	scratchDir := filepath.Join(tmpDir, "scratch")
 	os.MkdirAll(scratchDir, 0755) //nolint:errcheck
@@ -267,6 +280,7 @@ func TestBootcViaContainer_MountsSys(t *testing.T) {
 
 	install.SkopeoExportOCIFn = func(image, destDir, tmpdir string) error { return nil }
 	t.Cleanup(func() { install.SkopeoExportOCIFn = install.DefaultSkopeoExportOCI })
+	_ = stubHostVarTmpBind(t)
 
 	target := filepath.Join(tmpDir, "target")
 	if err := os.MkdirAll(target, 0o755); err != nil {
@@ -307,6 +321,7 @@ func TestBootcToDiskViaContainer_MountsSys(t *testing.T) {
 
 	install.SkopeoExportOCIFn = func(image, destDir, tmpdir string) error { return nil }
 	t.Cleanup(func() { install.SkopeoExportOCIFn = install.DefaultSkopeoExportOCI })
+	_ = stubHostVarTmpBind(t)
 
 	// BootcToDisk with SourceImgref set routes through bootcToDiskViaContainer.
 	oldStdout := os.Stdout

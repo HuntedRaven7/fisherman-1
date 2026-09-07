@@ -145,19 +145,70 @@ func (o Options) scratchDir() string {
 // btrfs-on-LUKS that made the cache invisible under /var/tmp (see #38).
 const containerOCICachePath = "/run/fisherman/oci-cache"
 
-// containerScratchTmpPath is the container-side path where the disk-backed
-// scratch dir is bound for containers/storage blob staging. containers/storage
-// defaults its TmpDir to /var/tmp and stages multi-GiB layer blobs there
-// (e.g. /var/tmp/container_images_storage*/63); on a live ISO that path is
-// fatal because bootc's install preflight re-mirrors the HOST's /var/tmp over
-// the container's (ensure_mirrored_host_mount, comparing statvfs f_fsid
-// against /proc/1/root/var/tmp via the host PID namespace) and on a live ISO
-// the host /var/tmp is the tiny dracut overlay (~1.4 GiB), so staging there
-// fails with ENOSPC (#20/#21). Likewise /tmp is replaced by a fresh tmpfs
-// (setup_tmp_mount), so neither /var/tmp nor /tmp can host big blobs. This
-// path is mounted away from both, so a storage.conf tmpdir pointing at it keeps
-// blob staging disk-backed no matter what bootc does to /var/tmp and /tmp.
-const containerScratchTmpPath = "/run/fisherman/tmp"
+// varTmpOverrideDir returns the scratch subdir that is bind-mounted over the
+// HOST's /var/tmp for the duration of an install. containers/image hardcodes
+// /var/tmp for multi-GiB blob staging (internal/tmpdir.unixTempDirForBigFiles,
+// reachable only via SystemContext.BigFilesTemporaryDir, which bootc's skopeo
+// subprocess never sets), and bootc's install preflight re-mirrors the
+// container's /var/tmp from the HOST's (ensure_mirrored_host_mount, comparing
+// statvfs f_fsid against /proc/1/root/var/tmp via the host PID namespace). On a
+// live ISO the host /var/tmp is the tiny dracut overlay (~1.4 GiB), so blob
+// staging there fails with ENOSPC (#20/#21). Without this bind, no storage.conf
+// tmpdir, $TMPDIR, or container-side mount survives those two mechanisms.
+func varTmpOverrideDir(scratch string) string {
+	return filepath.Join(scratch, "var-tmp-override")
+}
+
+// hostVarTmpBound reports whether /var/tmp is currently a bind mount of
+// override. A bind mount of a directory presents the source's device and
+// inode, so os.SameFile comparing the two stats is the idempotence check that
+// lets both the whole-install binder and skopeoExportOCI share one mount
+// without stacking.
+func hostVarTmpBound(override string) bool {
+	vt, err1 := os.Stat("/var/tmp")
+	ov, err2 := os.Stat(override)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return os.SameFile(vt, ov)
+}
+
+// DefaultHostVarTmpBind bind-mounts the disk-backed override directory over
+// the HOST's /var/tmp, in the host mount namespace (runner.HostArgs goes
+// through flatpak-spawn --host when inside a Flatpak sandbox, and /proc/1/root
+// resolves in that same namespace). It must be held for the whole install:
+// bootc re-mirrors the container's /var/tmp from the host's, so making the host
+// /var/tmp disk-backed is what keeps bootc's blob staging off the tiny dracut
+// overlay on a live ISO. The returned cleanup unmounts /var/tmp; it is a no-op
+// when the override was already bound.
+//
+// Overridable via HostVarTmpBindFn in tests.
+func DefaultHostVarTmpBind(scratch string) (func(), error) {
+	override := varTmpOverrideDir(scratch)
+	if err := os.MkdirAll(override, 0o1777); err != nil {
+		return nil, err
+	}
+	if hostVarTmpBound(override) {
+		fmt.Fprintf(os.Stdout, "# host /var/tmp already bind-mounted → %s\n", override)
+		return func() {}, nil
+	}
+	mntName, mntArgs := runner.HostArgs("mount", []string{"--bind", override, "/var/tmp"})
+	if err := exec.Command(mntName, mntArgs...).Run(); err != nil {
+		return nil, fmt.Errorf("mounting %s over host /var/tmp: %w", override, err)
+	}
+	fmt.Fprintf(os.Stdout, "# host /var/tmp bind-mounted → %s (disk-backed) for the install\n", override)
+	return func() {
+		umName, umArgs := runner.HostArgs("umount", []string{"/var/tmp"})
+		_ = exec.Command(umName, umArgs...).Run()
+	}, nil
+}
+
+// HostVarTmpBindFn ensures the HOST /var/tmp is disk-backed for the duration of
+// a bootc install. bootc's install preflight replaces the container's /var/tmp
+// with the host's, so this bind (not any container-side mount) is what prevents
+// ENOSPC during blob staging on live ISOs. Replace in tests to avoid real mount
+// syscalls. A nil cleanup means nothing was bound.
+var HostVarTmpBindFn = DefaultHostVarTmpBind
 
 // BuildBootcArgs builds the argument slice for `bootc install to-filesystem`.
 // resolvedTargetImgref is the --target-imgref value (empty to omit the flag).
@@ -364,6 +415,19 @@ func bootcViaContainer(opts Options) error {
 
 	scratch := opts.scratchDir()
 
+	// Disk-back the HOST's /var/tmp for the whole install. bootc's install
+	// preflight re-mirrors the container's /var/tmp from the host's (via the
+	// host PID namespace), and containers/image hardcodes /var/tmp for its
+	// multi-GiB blob staging — neither a storage.conf tmpdir nor a
+	// container-side mount survives both (#20/#21). On a live ISO the host
+	// /var/tmp is the tiny dracut overlay, so this bind is what makes the
+	// mirrored container /var/tmp disk-backed.
+	if cleanupVarTmp, vErr := HostVarTmpBindFn(scratch); vErr != nil {
+		progress.Info(fmt.Sprintf("warning: could not bind disk-backed dir over host /var/tmp (%v); blob staging may ENOSPC on this host", vErr))
+	} else if cleanupVarTmp != nil {
+		defer cleanupVarTmp()
+	}
+
 	// Non-composefs (ostree/grub2): the default VFS storage driver copies every
 	// image layer byte-for-byte when preparing the bootc container, which OOM-kills
 	// VMs on large images (>4 GB).  Probe whether the target scratch filesystem
@@ -470,13 +534,11 @@ func bootcViaContainer(opts Options) error {
 
 	if useOciLayout {
 		ociCacheHost := filepath.Join(scratch, "oci-cache")
-		// Both composefs and non-composefs installs need disk-backed /var/tmp
-		// inside the bootc container. containers/storage hardcodes its
-		// blob-staging TMPDir to /var/tmp, and bootc's internal imgstorage
-		// writes layer blobs there (e.g. /var/tmp/container_images_storage*/60)
-		// while reading the raw OCI blobs from the cache. On a live ISO
-		// /var/tmp must therefore be the disk-backed scratch dir — a tmpfs
-		// fills up and fails with ENOSPC on multi-GiB composefs images.
+		// Belt and braces on top of the whole-install host /var/tmp bind (see
+		// HostVarTmpBindFn above): bind the same disk-backed scratch dir at the
+		// container's /var/tmp and /tmp and point $TMPDIR at /var/tmp, so any
+		// process that writes big files without going through bootc's
+		// ensure_mirrored_host_mount still lands on disk, not a tmpfs.
 		// The OCI cache is mounted at the dedicated /run/fisherman/oci-cache
 		// path below, so bind-mounting the whole scratch dir at /var/tmp does
 		// not hide the cache (the original bug in #38).
@@ -485,18 +547,6 @@ func bootcViaContainer(opts Options) error {
 		podmanArgs = append(podmanArgs, "-e", "TMPDIR=/var/tmp")
 		podmanArgs = append(podmanArgs,
 			"-v", ociCacheHost+":"+containerOCICachePath+":ro")
-		// The /var/tmp and /tmp mounts above are not sufficient on their own:
-		// bootc's install preflight replaces the container's /var/tmp with the
-		// HOST's /var/tmp (ensure_mirrored_host_mount, using the host PID
-		// namespace) and replaces /tmp with a fresh tmpfs (setup_tmp_mount).
-		// On a live ISO the host /var/tmp is the small dracut overlay, so blob
-		// staging still ENOSPCs (#20/#21). Redirect containers/storage's TmpDir
-		// to the dedicated scratch-bound containerScratchTmpPath mount instead.
-		if opts.ComposeFsBackend {
-			var cleanupConf func()
-			podmanArgs, cleanupConf = appendStorageTmpDirArgs(podmanArgs, scratch, containerScratchTmpPath)
-			defer cleanupConf()
-		}
 	} else {
 		podmanArgs = append(podmanArgs, "-v", scratch+":/var/tmp:z")
 		podmanArgs = append(podmanArgs, "-v", scratch+":/tmp:z")
@@ -553,6 +603,17 @@ func bootcViaContainer(opts Options) error {
 // Only valid when fisherman is already running inside the bootc container image
 // (i.e. on the live ISO), where bootc auto-detects the source image.
 func bootcDirect(opts Options) error {
+	// Disk-back the host /var/tmp for the whole install. Even in direct mode
+	// bootc and skopeo stage multi-GiB blobs at /var/tmp (hardcoded in
+	// containers/image), which on a live ISO is the tiny dracut overlay.
+	// bootcDirect is only reached on live-ISO hosts, where /var is
+	// space-constrained. See HostVarTmpBindFn.
+	if cleanupVarTmp, vErr := HostVarTmpBindFn(opts.scratchDir()); vErr != nil {
+		progress.Info(fmt.Sprintf("warning: could not bind disk-backed dir over host /var/tmp (%v); blob staging may ENOSPC on this host", vErr))
+	} else if cleanupVarTmp != nil {
+		defer cleanupVarTmp()
+	}
+
 	// In live-ISO mode bootc still needs the raw OCI layout for composefs
 	// installs, but there is no podman-run wrapper path that would export it for
 	// us. Use the target ref (falling back to SourceImgref if present) to export
@@ -636,6 +697,15 @@ func bootcToDiskViaContainer(opts Options, diskDevice, filesystem string) (effec
 
 	scratch := opts.scratchDir()
 
+	// Same whole-install host /var/tmp disk-backing rationale as
+	// bootcViaContainer (#20/#21): bootc mirrors the container's /var/tmp from
+	// the host's, and containers/image hardcodes /var/tmp for blob staging.
+	if cleanupVarTmp, vErr := HostVarTmpBindFn(scratch); vErr != nil {
+		progress.Info(fmt.Sprintf("warning: could not bind disk-backed dir over host /var/tmp (%v); blob staging may ENOSPC on this host", vErr))
+	} else if cleanupVarTmp != nil {
+		defer cleanupVarTmp()
+	}
+
 	podmanArgs := []string{
 		"run", "--rm",
 		"--privileged",
@@ -650,13 +720,10 @@ func bootcToDiskViaContainer(opts Options, diskDevice, filesystem string) (effec
 		podmanArgs = append(podmanArgs, "-v", "/sys/firmware/efi/efivars:/sys/firmware/efi/efivars")
 	}
 
-	// Both composefs and non-composefs installs need disk-backed /var/tmp
-	// and /tmp inside the bootc container: containers/storage hardcodes its
-	// blob-staging TMPDir to /var/tmp (e.g. /var/tmp/container_images_storage*/),
-	// but the storage.conf tmpdir or $TMPDIR may redirect to /tmp, which is
-	// typically a tmpfs on live ISOs. Bind-mounting scratch at both paths and
-	// setting TMPDIR=/var/tmp ensures ENOSPC never hits a tmpfs during
-	// multi-GiB blob staging.
+	// Belts and braces over the whole-install host /var/tmp bind (see the
+	// HostVarTmpBindFn call above): bind scratch at the container's /var/tmp and
+	// /tmp and point $TMPDIR at /var/tmp so big-file writes outside bootc's
+	// ensure_mirrored_host_mount still land on disk, not a tmpfs.
 	// The OCI cache is mounted at the dedicated /run/fisherman/oci-cache path,
 	// so mounting the whole scratch dir at /var/tmp and /tmp does not hide
 	// the cache.
@@ -675,13 +742,6 @@ func bootcToDiskViaContainer(opts Options, diskDevice, filesystem string) (effec
 			return "", fmt.Errorf("exporting image to OCI layout: %w", err)
 		}
 		podmanArgs = append(podmanArgs, "-v", ociDir+":"+containerOCICachePath+":ro")
-		// Same live-ISO ENOSPC defense as bootcViaContainer: bootc's preflight
-		// swaps the container's /var/tmp for the host's (tiny overlay on a live
-		// ISO) and its /tmp for a tmpfs, so redirect containers/storage's blob
-		// staging to the dedicated scratch-bound path.
-		var cleanupConf func()
-		podmanArgs, cleanupConf = appendStorageTmpDirArgs(podmanArgs, scratch, containerScratchTmpPath)
-		defer cleanupConf()
 		bootcArgs = append(bootcArgs, "--source-imgref", "oci:"+containerOCICachePath)
 		bootcArgs = append(bootcArgs, diskDevice)
 		effectiveDisk = diskDevice
@@ -781,136 +841,6 @@ func bareImageRef(image string) string {
 	return image
 }
 
-// injectStorageTmpDir returns a copy of the containers/storage TOML config
-// string with the tmpdir field in the [storage] section set to newLine
-// (e.g. `tmpdir = "/scratch"`). If the field already exists it is replaced;
-// otherwise it is inserted after the last key=value line in [storage].
-// InjectStorageTmpDir is exported for testing. Use injectStorageTmpDir
-// (the var below) for all internal call sites.
-func InjectStorageTmpDir(conf, newLine string) string {
-	return injectStorageTmpDir(conf, newLine)
-}
-
-func injectStorageTmpDir(conf, newLine string) string {
-	lines := strings.Split(conf, "\n")
-	inStorage := false
-	replaced := false
-	insertAfter := -1
-
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "[") {
-			if trimmed == "[storage]" {
-				inStorage = true
-				insertAfter = i
-			} else if inStorage {
-				inStorage = false // another section started
-			}
-		} else if inStorage {
-			// Replace an existing tmpdir = "…" line.
-			if strings.HasPrefix(strings.ToLower(trimmed), "tmpdir") &&
-				strings.Contains(trimmed, "=") {
-				lines[i] = newLine
-				replaced = true
-			} else if trimmed != "" {
-				insertAfter = i // track last non-blank line in section
-			}
-		}
-	}
-
-	if !replaced && insertAfter >= 0 {
-		// Insert after the last key=value line in [storage].
-		result := make([]string, 0, len(lines)+1)
-		for i, line := range lines {
-			result = append(result, line)
-			if i == insertAfter {
-				result = append(result, newLine)
-			}
-		}
-		return strings.Join(result, "\n")
-	}
-	return strings.Join(lines, "\n")
-}
-
-// writeStorageConfWithTmpDir writes a containers/storage configuration that
-// mirrors the current effective config (from CONTAINERS_STORAGE_CONF or
-// /etc/containers/storage.conf) with the tmpdir field overridden to scratchDir.
-//
-// containers/storage defaults TMPDir to /var/tmp and only falls back to
-// checking $TMPDIR when the config file contains no tmpdir line — and even
-// then only in newer versions. Setting $TMPDIR alone in the subprocess
-// environment is not sufficient on the live ISO (VFS driver, no tmpdir in
-// /etc/containers/storage.conf), so we supply an explicit config file.
-//
-// The caller must remove the returned path when done.
-func writeStorageConfWithTmpDir(confDir, scratchDir string) (string, error) {
-	if err := os.MkdirAll(confDir, 0o755); err != nil {
-		return "", err
-	}
-
-	// Read the current effective storage config so we preserve the driver,
-	// graphroot, runroot, and any additionalimagestores that let skopeo find
-	// the image (e.g. on a live ISO the driver is "vfs", not "overlay").
-	confSrc := os.Getenv("CONTAINERS_STORAGE_CONF")
-	if confSrc == "" {
-		confSrc = "/etc/containers/storage.conf"
-	}
-	existing, err := os.ReadFile(confSrc)
-	if err != nil {
-		// Fall back to a minimal VFS config that covers the live-ISO case.
-		existing = []byte("[storage]\ndriver = \"vfs\"\n" +
-			"runroot = \"/run/containers/storage\"\n" +
-			"graphroot = \"/var/lib/containers/storage\"\n")
-	}
-
-	escaped := strings.ReplaceAll(scratchDir, `"`, `\"`)
-	newLine := `tmpdir = "` + escaped + `"`
-	content := injectStorageTmpDir(string(existing), newLine)
-
-	f, err := os.CreateTemp(confDir, "storage-tmpdir-*.conf")
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	if _, err := f.WriteString(content); err != nil {
-		os.Remove(f.Name())
-		return "", err
-	}
-	return f.Name(), nil
-}
-
-// appendStorageTmpDirArgs pins containers/storage's TmpDir to a disk-backed path
-// inside the bootc container by mounting a fisherman-generated storage.conf and
-// forwarding CONTAINERS_STORAGE_CONF.
-//
-// containers/storage defaults TmpDir to /var/tmp and stages multi-GiB layer
-// blobs there (e.g. /var/tmp/container_images_storage*/63). Merely binding the
-// scratch dir at /var/tmp in the container is not enough: bootc's install
-// preflight (ensure_mirrored_host_mount) compares the statvfs f_fsid of the
-// container's /var/tmp with /proc/1/root/var/tmp (the HOST's /var/tmp, reached
-// through the host PID namespace) and, when they differ — which is always the
-// case on a live ISO whose host /var/tmp is the small dracut overlay — replaces
-// the container's /var/tmp with a recursive bind of the host's. Blob staging
-// then ENOSPCs (#20/#21). Pointing a storage.conf tmpdir at the dedicated
-// containerScratchTmpPath mount (a scratch subdir bound away from /var/tmp and
-// /tmp) keeps staging disk-backed regardless of what bootc does to those paths.
-// This is the fix bootc-installer applied in projectbluefin/bootc-installer#188.
-//
-// Returns the new args slice and a cleanup that removes the generated conf.
-// Always safe to defer the cleanup immediately.
-func appendStorageTmpDirArgs(podmanArgs []string, scratch, containerTmpDir string) ([]string, func()) {
-	hostConf, err := writeStorageConfWithTmpDir(filepath.Join(scratch, "fisherman-conf"), containerTmpDir)
-	if err != nil {
-		progress.Info(fmt.Sprintf("warning: could not write storage.conf tmpdir override: %v", err))
-		return podmanArgs, func() {}
-	}
-	podmanArgs = append(podmanArgs,
-		"-v", scratch+":"+containerTmpDir+":z",
-		"-v", hostConf+":/etc/containers/storage.conf:ro",
-		"-e", "CONTAINERS_STORAGE_CONF=/etc/containers/storage.conf")
-	return podmanArgs, func() { os.Remove(hostConf) }
-}
-
 // skopeoExportOCI exports an image from containers-storage to an OCI directory
 // layout. The composefs-backend requires raw OCI blobs (compressed layer
 // tarballs) that podman pull does not preserve; skopeo reconstructs them from
@@ -932,30 +862,21 @@ func skopeoExportOCI(image, destDir, tmpdir string) error {
 
 	// Redirect /var/tmp to the disk-backed scratch dir before the export.
 	//
-	// Root cause: containers/image's TypeBigFiles path calls store.TmpDir()
-	// which returns /var/tmp (containers/storage hardcoded default) regardless
-	// of the TMPDIR env var. On live ISOs /var/tmp is on the dracut overlayfs
-	// (~1.4 GiB) — too small for 5-6 GiB layer blobs. Both podman and skopeo
-	// hit this when reading from containers-storage.
+	// Root cause: containers/image hardcodes /var/tmp for its multi-GiB big-file
+	// staging (internal/tmpdir.unixTempDirForBigFiles, only overridable via
+	// SystemContext.BigFilesTemporaryDir, which skopeo does not set). On live
+	// ISOs /var/tmp is on the dracut overlayfs (~1.4 GiB) — too small for
+	// multi-GiB layer blobs. Both podman and skopeo hit this.
 	//
-	// Fix: bind-mount the scratch dir over /var/tmp so the hardcoded path
-	// becomes disk-backed. Deferred umount restores it after export.
-	varTmpOverride := filepath.Join(tmpdir, "var-tmp-override")
-	if err := os.MkdirAll(varTmpOverride, 0o1777); err == nil {
-		mntName, mntArgs := runner.HostArgs("mount", []string{"--bind", varTmpOverride, "/var/tmp"})
-		if exec.Command(mntName, mntArgs...).Run() == nil {
-			fmt.Fprintf(os.Stdout, "# /var/tmp bind-mounted → %s for blob staging\n", varTmpOverride)
-			defer func() {
-				umName, umArgs := runner.HostArgs("umount", []string{"/var/tmp"})
-				// Best-effort teardown in a defer: if the unmount fails there
-				// is nothing useful left to do about it, and the install
-				// result must not change because cleanup was untidy. Discard
-				// explicitly so that intent is visible (and errcheck-clean).
-				_ = exec.Command(umName, umArgs...).Run()
-			}()
-		} else {
-			fmt.Fprintf(os.Stdout, "# warning: /var/tmp bind-mount failed — ENOSPC likely on overlay tmpfs\n")
-		}
+	// Fix: bind-mount the scratch dir over /var/tmp in the host mount namespace
+	// so the hardcoded path becomes disk-backed. Idempotent with the
+	// whole-install binder (DefaultHostVarTmpBind + hostVarTmpBound) so a
+	// standalone export and a container install share one mount without stacking.
+	// Deferred umount restores it after export.
+	if cleanupVarTmp, vErr := DefaultHostVarTmpBind(tmpdir); vErr != nil {
+		fmt.Fprintf(os.Stdout, "# warning: /var/tmp bind-mount failed (%v) — ENOSPC likely on overlay tmpfs\n", vErr)
+	} else if cleanupVarTmp != nil {
+		defer cleanupVarTmp()
 	}
 
 	skopeoArgs := []string{

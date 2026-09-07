@@ -19,6 +19,21 @@ func allowRegistryPull(t *testing.T) {
 	t.Cleanup(func() { install.HostVarConstrainedFn = install.DefaultHostVarConstrained })
 }
 
+// stubHostVarTmpBind replaces the real host /var/tmp binder (which issues
+// mount/umount syscalls against the host namespace) with a no-op so install-path
+// tests don't require privileges or modify the test host's /var/tmp. The stub
+// records the scratch dir it was invoked with.
+func stubHostVarTmpBind(t *testing.T) *string {
+	t.Helper()
+	scratch := ""
+	install.HostVarTmpBindFn = func(s string) (func(), error) {
+		scratch = s
+		return func() {}, nil
+	}
+	t.Cleanup(func() { install.HostVarTmpBindFn = install.DefaultHostVarTmpBind })
+	return &scratch
+}
+
 func TestCheckImage_NeedsPullWhenNotCached(t *testing.T) {
 	allowRegistryPull(t)
 	call := 0
@@ -352,6 +367,7 @@ func TestBootcInstall_DirectComposeFsExportsOCI(t *testing.T) {
 		return nil
 	}
 	defer func() { install.SkopeoExportOCIFn = install.DefaultSkopeoExportOCI }()
+	_ = stubHostVarTmpBind(t)
 
 	err := install.BootcInstall(install.Options{
 		ComposeFsBackend: true,
@@ -390,6 +406,7 @@ func TestBootcInstall_DirectComposeFsUsesCustomScratchDir(t *testing.T) {
 		return nil
 	}
 	defer func() { install.SkopeoExportOCIFn = install.DefaultSkopeoExportOCI }()
+	_ = stubHostVarTmpBind(t)
 
 	err := install.BootcInstall(install.Options{
 		ComposeFsBackend: true,
@@ -510,55 +527,6 @@ func TestNeedsContainerStorageMount_ComposeFsBackend(t *testing.T) {
 	}
 }
 
-// TestInjectStorageTmpDir verifies that injectStorageTmpDir correctly adds or
-// replaces the tmpdir line in a containers/storage TOML config string.
-func TestInjectStorageTmpDir(t *testing.T) {
-	newLine := `tmpdir = "/scratch"`
-
-	t.Run("replaces existing tmpdir", func(t *testing.T) {
-		conf := "[storage]\ndriver = \"vfs\"\ntmpdir = \"/old\"\ngraphroot = \"/var/lib/containers/storage\"\n"
-		result := install.InjectStorageTmpDir(conf, newLine)
-		if !strings.Contains(result, `tmpdir = "/scratch"`) {
-			t.Errorf("expected replaced tmpdir, got:\n%s", result)
-		}
-		if strings.Contains(result, `"/old"`) {
-			t.Errorf("old tmpdir still present:\n%s", result)
-		}
-	})
-
-	t.Run("injects when no tmpdir line", func(t *testing.T) {
-		conf := "[storage]\ndriver = \"vfs\"\nrunroot = \"/run/containers/storage\"\ngraphroot = \"/var/lib/containers/storage\"\n"
-		result := install.InjectStorageTmpDir(conf, newLine)
-		if !strings.Contains(result, `tmpdir = "/scratch"`) {
-			t.Errorf("tmpdir not injected, got:\n%s", result)
-		}
-		// Existing fields must still be present.
-		if !strings.Contains(result, `driver = "vfs"`) {
-			t.Errorf("driver line missing:\n%s", result)
-		}
-	})
-
-	t.Run("injects before next section", func(t *testing.T) {
-		conf := "[storage]\ndriver = \"overlay\"\n\n[storage.options]\nadditionalimagestores = []\n"
-		result := install.InjectStorageTmpDir(conf, newLine)
-		if !strings.Contains(result, `tmpdir = "/scratch"`) {
-			t.Errorf("tmpdir not injected, got:\n%s", result)
-		}
-		// additionalimagestores must survive unchanged.
-		if !strings.Contains(result, "additionalimagestores") {
-			t.Errorf("[storage.options] section lost:\n%s", result)
-		}
-	})
-
-	t.Run("handles empty config (live-ISO fallback)", func(t *testing.T) {
-		conf := ""
-		result := install.InjectStorageTmpDir(conf, newLine)
-		// No [storage] section → nothing to inject, just return unchanged.
-		// The fallback path in writeStorageConfWithTmpDir handles this.
-		_ = result // just must not panic
-	})
-}
-
 // TestBootcInstall_NonComposefsContainerExportsOCI verifies that when
 // SourceImgref is set and ComposeFsBackend is false (non-composefs container
 // mode with overlay redirect), the OCI export function IS called.  Regression
@@ -592,6 +560,7 @@ func TestBootcInstall_NonComposefsContainerExportsOCI(t *testing.T) {
 		return os.WriteFile(destDir+"/index.json", []byte("{}"), 0644)
 	}
 	defer func() { install.SkopeoExportOCIFn = install.DefaultSkopeoExportOCI }()
+	_ = stubHostVarTmpBind(t)
 
 	// The overlay redirect requires scratch on an overlay-capable filesystem
 	// (ext4/xfs/btrfs).  t.TempDir() is typically on tmpfs.  Use /var/tmp
@@ -643,6 +612,7 @@ func TestBootcInstall_NonComposefsDirectSkipsOCIExport(t *testing.T) {
 		return nil
 	}
 	defer func() { install.SkopeoExportOCIFn = install.DefaultSkopeoExportOCI }()
+	_ = stubHostVarTmpBind(t)
 
 	err := install.BootcInstall(install.Options{
 		ComposeFsBackend: false,
