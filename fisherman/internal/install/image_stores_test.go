@@ -116,3 +116,52 @@ func TestVarTmpOverrideHelpers(t *testing.T) {
 		t.Error("hostVarTmpBound(true) before any bind; is /var/tmp really an alias of the override dir?")
 	}
 }
+
+func TestDefaultHostVarConstrained(t *testing.T) {
+	// DefaultHostVarConstrained inspects /var's filesystem type.
+	// If /var is tmpfs or overlayfs, it should return true; otherwise false.
+	ft, err := filesystemType("/var")
+	got := DefaultHostVarConstrained()
+	if err != nil {
+		if got != false {
+			t.Errorf("DefaultHostVarConstrained() = %v when filesystemType errors, want false", got)
+		}
+	} else if ft == "tmpfs" || ft == "overlayfs" {
+		if !got {
+			t.Errorf("DefaultHostVarConstrained() = false, want true for /var on %s", ft)
+		}
+	} else {
+		if got {
+			t.Errorf("DefaultHostVarConstrained() = true, want false for /var on %s", ft)
+		}
+	}
+}
+
+func TestDefaultHostVarTmpBind(t *testing.T) {
+	scratch := t.TempDir()
+	override := varTmpOverrideDir(scratch)
+
+	// In non-root test environments (e.g. unprivileged CI or local dev),
+	// mount will fail with EPERM. In privileged CI, it may succeed.
+	// Either way, DefaultHostVarTmpBind must ensure the directory is created (01777).
+	cleanup, err := DefaultHostVarTmpBind(scratch)
+	info, statErr := os.Stat(override)
+	if statErr != nil {
+		t.Fatalf("override dir %s not created: %v", override, statErr)
+	}
+	if !info.IsDir() {
+		t.Fatalf("override path %s is not a directory", override)
+	}
+
+	if err == nil && cleanup != nil {
+		// If mount succeeded (running as root / privileged), test idempotency and cleanup unmount.
+		cleanup2, err2 := DefaultHostVarTmpBind(scratch)
+		if err2 != nil {
+			t.Errorf("second DefaultHostVarTmpBind call failed: %v", err2)
+		}
+		if cleanup2 != nil {
+			cleanup2()
+		}
+		cleanup()
+	}
+}

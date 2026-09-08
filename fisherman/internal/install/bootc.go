@@ -870,10 +870,10 @@ func skopeoExportOCI(image, destDir, tmpdir string) error {
 	//
 	// Fix: bind-mount the scratch dir over /var/tmp in the host mount namespace
 	// so the hardcoded path becomes disk-backed. Idempotent with the
-	// whole-install binder (DefaultHostVarTmpBind + hostVarTmpBound) so a
+	// whole-install binder (HostVarTmpBindFn + hostVarTmpBound) so a
 	// standalone export and a container install share one mount without stacking.
 	// Deferred umount restores it after export.
-	if cleanupVarTmp, vErr := DefaultHostVarTmpBind(tmpdir); vErr != nil {
+	if cleanupVarTmp, vErr := HostVarTmpBindFn(tmpdir); vErr != nil {
 		fmt.Fprintf(os.Stdout, "# warning: /var/tmp bind-mount failed (%v) — ENOSPC likely on overlay tmpfs\n", vErr)
 	} else if cleanupVarTmp != nil {
 		defer cleanupVarTmp()
@@ -1102,7 +1102,7 @@ func CheckImage(image string) ImageCheck {
 	// surface a clear error if it is truly absent.
 	remoteOut, remoteErr := SkopeoInspectFn("docker://" + bareImageRef(image))
 	if remoteErr != nil {
-		return ImageCheck{NeedsPull: false, Offline: true}
+		return ImageCheck{NeedsPull: true}
 	}
 	var remote manifest
 	if err := json.Unmarshal(remoteOut, &remote); err != nil {
